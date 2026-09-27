@@ -36,10 +36,20 @@ Docker 命名卷上）。支持 **一次提交多行签收/退回记录**（每�
 记录——撤销前按原顺序 **跳过该记录重放** 其余有效记录，若任何后续记录导致数量
 越界则 **拒绝撤销并指出冲突记录**，原台账保持不变。页面实时展示记录列表与各箱
 各批次的 **净签收 / 待交件数**。
+支持 **运输延误推演**：在分箱结果页选择一个运输段并填写 **新增时长**（小时，
+非负，0 表示不延误），系统以 **生成方案时的输入快照和已装箱明细为基准**，
+**箱号、批次及件数保持不变**（不重新装箱，未装载批次不参与），重新计算
+**延误后的总时长、逐段设定点与各批累计度时**——相邻同锁温组段仍共用设定点，
+选点与预算判定完全沿用规划器规则（单元候选取共享可行温度段端点与落在其中的
+首选区间端点，结合单元开始前累计度时贪心选点，平局取较低温度）；页面
+**逐箱对比原值与延误后值**（段时长、设定点、累计度时、剩余预算），并汇总
+**超出最长运输时长或度时预算的批次**（度时超限时标出 **首次超限段**）；
+没有受影响批次时明确显示 **可继续运输**。推演绑定生成方案时的输入快照，
+修改输入后旧推演自动标记为 **已过期**，需重新生成方案。
 支持在页面上随时修改输入并重新规划。
 
 - 后端：FastAPI（规划算法见 `app/planner.py`；交接台账见 `app/handover.py`，
-  使用 SQLite 持久化，见 `app/db.py`）
+  使用 SQLite 持久化，见 `app/db.py`；运输延误推演见 `app/delay.py`）
 - 前端：原生 HTML / CSS / JavaScript（无 CDN 依赖，离线可用）
 - 部署：Docker Compose（数据库初始化与持久化卷已纳入启动）
 
@@ -80,6 +90,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 规划接口 | `POST http://localhost:8000/api/plan` |
 | 容灾评估接口 | `POST http://localhost:8000/api/zone-failure-assessment` |
 | 实测温度复核接口 | `POST http://localhost:8000/api/temperature-review` |
+| 运输延误推演接口 | `POST http://localhost:8000/api/transport-delay` |
 | 创建交接单 | `POST http://localhost:8000/api/handover-orders` |
 | 交接单列表 / 详情 | `GET http://localhost:8000/api/handover-orders` · `GET /api/handover-orders/{id}` |
 | 提交签收/退回记录 | `POST http://localhost:8000/api/handover-orders/{id}/records` |
@@ -155,7 +166,24 @@ APP_PORT=9000 docker compose up -d --build
    - 复核绑定 **生成方案时的输入快照**；此后修改任意输入，复核区出现
      **「已过期」** 标记并禁用复核按钮，重新生成方案后即可再次复核；
    - 点击 **「下载 CSV 模板」** 可按当前方案全程秒数生成空白模板。
-8. 结果页底部的 **到货交接台账** 区管理交接单（无需重新生成方案即可查看，
+8. 生成方案后，在结果页 **运输延误推演** 区选择要推演的 **运输段**
+   （单一温区模式下全程视为第 1 段）并填写 **新增时长（小时，非负，0 表示
+   不延误）**，点击 **「⏱ 开始推演」**：
+   - 推演以 **生成方案时的输入快照和已装箱明细为基准**，**箱号、批次及件数
+     不变**（不重新装箱，未装载批次不参与）；仅所选段时长增加，其余段的
+     时长、温区与锁温组均不变；
+   - 顶部汇总推演段与新增时长、**总时长 原值 → 延误后值**、快照指纹，
+     并给出段时长对比表（延误段高亮）；
+   - **没有受影响批次** 时显示绿色 **「✓ …可继续运输」**；否则显示红色
+     不可继续运输提示，并列出 **受影响批次表**：箱号·批次、件数、
+     **总时长 / 最长运输时长**、**累计度时 / 预算** 原值→延误后值与超限类型；
+     **度时超限的批次标出首次超限段（第几段·段名）**；
+   - 下方 **逐箱对比**：每箱列出逐段 **时长** 与 **设定点 原值→延误后值**
+     （相邻同锁温组段仍共用一个设定点，设定点改变时高亮标注；延误段行黄色
+     高亮），以及各批 **累计度时、预算、剩余预算的 原值→延误后值** 与状态；
+   - 推演绑定 **生成方案时的输入快照**（响应含快照指纹）；修改任意输入后
+     推演区出现 **「已过期」** 标记并禁用推演按钮，重新生成方案后即可再次推演。
+9. 结果页底部的 **到货交接台账** 区管理交接单（无需重新生成方案即可查看，
    页面打开时自动加载已有交接单，重启后可继续办理）：
    - 生成方案后点击 **「🧾 从当前方案创建交接单」**，系统按当前方案冻结
      各箱各批次的应交件数生成新交接单；此后修改规划输入不影响该单；
@@ -261,7 +289,118 @@ APP_PORT=9000 docker compose up -d --build
 - 响应携带输入快照的 SHA-256 指纹（`input_fingerprint`），输入变化后前端
   将旧复核结果标记为已过期，需重新生成方案后再复核。
 
-## 八、到货交接台账规则
+## 八、运输延误推演规则
+
+- 推演请求携带 **生成方案时的输入快照**（`plan_input`，与 `/api/plan`
+  请求体相同）、运输段序号 `segment_no`（对应方案 `segments[].segment_no`；
+  单一温区模式下全程视为第 1 段）与 **新增时长** `extra_hours`（小时，
+  非负；负数返回 422，非数字/非有限值返回 400）；
+- 服务端按快照 **重新规划** 得到基准方案，以其 **已装箱明细为基准**——
+  **箱号、批次及各批件数保持不变，不重新装箱**；基准方案没有任何已装箱
+  货物、或运输段序号超出方案段数时返回 400。未装载批次不在运输途中，
+  不参与判定；
+- 仅所选段时长增加 `extra_hours`，其余段的时长、可用温区与锁温组均不变；
+  **延误后总时长 = 原总时长 + 新增时长**；延误段位于锁温组内时，该锁温
+  单元的合计时长随之增加；
+- **逐段设定点沿用规划器规则重新选点**：决策单元仍为相邻同锁温组的连续段
+  （共用一个设定点）或单个未分组段；候选设定点仍取单元共享可行温度段
+  （箱内允许温区交集 ∩ 各段温区，保留真实区间）的端点与落在其中的各批
+  首选区间端点，结合 **单元开始前各批累计度时**，选取使 **单元结束后
+  箱内最大累计预算使用率最低** 的点，平局取较低温度；箱内无预算批次时
+  取最宽可行区间中点。因此延误不仅改变该段暴露量，还可能使 **后续单元的
+  设定点随之改变**（锁温组内各段共享点同样会重新计算）；
+- **逐箱对比原值与延误后值**：各段时长与设定点、各批累计度时、剩余预算
+  与使用率（`exposure_original/exposure_delayed`、
+  `setpoint_original/setpoint_delayed`、`setpoint_changed` 等）；
+- **受影响批次**（按 箱×批 展开，同批分拆到多箱时分别列出各箱件数）为
+  延误后出现下列任一情况的已装箱批次：
+  - **超最长运输时长**（`max_transport_hours`）：延误后总时长严格大于
+    该批「最长运输时长」（恰等不算超）；
+  - **超度时预算**（`degree_hours`）：重新选点后该批累计度时严格大于预算，
+    响应标出 **度时首次超限段** `first_exceeded_segment_no` /
+    `first_exceeded_segment_name`；
+- `can_continue` 为 `true` 当且仅当没有任何受影响批次，`verdict` 给出
+  可直接展示的中文结论（无受影响批次时明确为 **可继续运输**）；
+- 响应携带输入快照的 SHA-256 指纹（`input_fingerprint`），输入变化后前端
+  将旧推演结果标记为已过期，需重新生成方案后再推演。
+
+### 运输延误推演接口示例
+
+```bash
+# 对第 3 段「末端配送」推演 8 小时延误(plan_input 与 /api/plan 请求体相同)
+curl -X POST http://localhost:8000/api/transport-delay \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_input": {
+      "box_capacity": 12,
+      "segments": [
+        {"name": "干线冷链", "hours": 14,
+         "zones": [{"name": "冷冻区", "t_min": -18, "t_max": -2},
+                   {"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+        {"name": "支线转运", "hours": 6,
+         "zones": [{"name": "冷冻区", "t_min": -18, "t_max": -2},
+                   {"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+        {"name": "末端配送", "hours": 4,
+         "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]}
+      ],
+      "cargoes": [
+        {"name": "三文鱼", "units": 10, "unit_volume": 0.4,
+         "t_min": -2, "t_max": 2, "preferred_t_min": -1, "preferred_t_max": 1,
+         "max_degree_hours": 30, "max_transport_hours": 26}
+      ]
+    },
+    "segment_no": 3,
+    "extra_hours": 8
+  }'
+```
+
+总时长 24h → 32h，超过三文鱼的最长运输时长 26h，响应（节选）：
+
+```json
+{
+  "input_fingerprint": "…",
+  "delay": {"segment_no": 3, "segment_name": "末端配送", "extra_hours": 8.0},
+  "total_hours": {"original": 24.0, "delayed": 32.0, "delta": 8.0},
+  "segments": [
+    {"segment_no": 1, "name": "干线冷链", "hours_original": 14.0, "hours_delayed": 14.0, "is_delayed": false},
+    {"segment_no": 2, "name": "支线转运", "hours_original": 6.0, "hours_delayed": 6.0, "is_delayed": false},
+    {"segment_no": 3, "name": "末端配送", "hours_original": 4.0, "hours_delayed": 12.0, "is_delayed": true}
+  ],
+  "boxes": [
+    {"box_no": 1, "items": [{"batch_no": 1, "name": "三文鱼", "units": 10}],
+     "segment_setpoints": [
+       {"segment_no": 1, "hours_original": 14.0, "hours_delayed": 14.0,
+        "setpoint_original": 0.0, "setpoint_delayed": 0.0, "setpoint_changed": false},
+       {"segment_no": 3, "hours_original": 4.0, "hours_delayed": 12.0, "is_delayed": true,
+        "setpoint_original": 0.0, "setpoint_delayed": 0.0, "setpoint_changed": false}
+     ],
+     "heat_exposure": [
+       {"batch_no": 1, "max_transport_hours": 26.0,
+        "exposure_original": 0.0, "exposure_delayed": 0.0,
+        "exceeded_original": false, "exceeded_delayed": false,
+        "first_exceeded_segment_no": null, "reasons": ["max_transport_hours"]}
+     ]}
+  ],
+  "affected_batches": [
+    {"box_no": 1, "batch_no": 1, "name": "三文鱼", "units": 10,
+     "reasons": ["max_transport_hours"], "max_transport_hours": 26.0,
+     "total_hours_original": 24.0, "total_hours_delayed": 32.0,
+     "max_degree_hours": 30.0, "exposure_original": 0.0, "exposure_delayed": 0.0,
+     "first_exceeded_segment_no": null, "first_exceeded_segment_name": null}
+  ],
+  "summary": {"box_count": 1, "affected_item_count": 1, "affected_box_count": 1,
+              "affected_batch_count": 1, "affected_units": 10,
+              "max_transport_hours_violation_count": 1,
+              "degree_hours_violation_count": 0, "can_continue": false},
+  "can_continue": false,
+  "verdict": "第 3 段「末端配送」延误 8.0h 后总时长 24.0h → 32.0h,共 1 个批次(10 件)超出最长运输时长或度时预算,不可继续运输,请重新规划或调整运输方案"
+}
+```
+
+`extra_hours` 填 0 时延误后值与原值完全一致，`can_continue` 为 `true`
+（结论为「可继续运输」），可用于校验推演基准与页面方案一致。
+
+## 九、到货交接台账规则
 
 - **创建交接单**：请求体携带规划输入快照（`plan_input`，与 `/api/plan`
   相同），服务端按快照 **重新规划**，把结果中各箱各批次的已装件数冻结为
@@ -335,7 +474,7 @@ curl http://localhost:8000/api/handover-orders/1
 | `summary` | 箱数、明细项数、应交/净签收/待交总件数、记录总数/有效数/已撤销数 |
 | 撤销 409 响应 `conflicts[]` | 冲突记录明细:`record_id`、`kind`、`box_no`、`batch_no`、`units`、`resulting_net`(重放后越界的净签收量)、`due_units` |
 
-## 九、接口示例
+## 十、接口示例
 
 ### 单一温区模式（兼容原有调用）
 
@@ -732,7 +871,7 @@ curl -X POST http://localhost:8000/api/temperature-review \
 }
 ```
 
-## 十、项目结构
+## 十一、项目结构
 
 ```
 .
@@ -741,6 +880,7 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── planner.py     # 温区兼容 + 容量约束 + 热暴露预算 + 锁温区段分箱算法
 │   ├── resilience.py  # 单温区故障容灾评估(逐温区模拟失效并重规划)
 │   ├── review.py      # 实测温度复核(CSV 校验、仪器误差带、确定/可能超界切段、度时上下界积分)
+│   ├── delay.py       # 运输延误推演(段时长增加后重算逐段设定点与各批累计度时,逐箱对比)
 │   ├── handover.py    # 到货交接台账(交接单冻结、多行签收/退回整笔入账、撤销重放校验)
 │   ├── db.py          # SQLite 连接与建表(WAL、外键、显式事务)
 │   └── schemas.py     # 请求模型
@@ -749,7 +889,8 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── styles.css
 │   └── app.js
 ├── tests/
-│   └── test_handover.py  # 台账 API 测试(python tests/test_handover.py)
+│   ├── test_handover.py  # 台账 API 测试(python tests/test_handover.py)
+│   └── test_delay.py     # 延误推演测试(python tests/test_delay.py)
 ├── Dockerfile
 ├── docker-compose.yml # 含 SQLite 初始化与 handover-data 持久化卷
 ├── .env.example

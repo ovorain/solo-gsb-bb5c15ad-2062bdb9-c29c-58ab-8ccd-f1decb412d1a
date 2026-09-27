@@ -7,11 +7,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, handover
+from . import db, delay, handover
 from .planner import plan
 from .resilience import assess_zone_failures
 from .review import review
 from .schemas import (
+    DelayRequest,
     HandoverOrderCreate,
     HandoverRecordsSubmit,
     PlanRequest,
@@ -38,8 +39,13 @@ app = FastAPI(
     "以及到货交接台账:从当前方案创建交接单冻结各箱各批次应交件数,"
     "多行签收/退回整笔入账(净签收量不得小于 0 或超过应交量),"
     "支持撤销记录(重放校验,越界则拒绝并指出冲突记录),"
-    "交接单与记录存入 SQLite,重启后可继续办理",
-    version="1.7.0",
+    "交接单与记录存入 SQLite,重启后可继续办理;"
+    "以及运输延误推演:选择一个运输段并填写新增时长(小时,非负),"
+    "以生成方案时的输入快照和已装箱明细为基准,箱号/批次/件数不变,"
+    "重新计算延误后总时长、逐段设定点与各批累计度时,逐箱对比原值,"
+    "列出超出最长运输时长或度时预算的批次并标出度时首次超限段,"
+    "没有受影响批次时明确返回可继续运输",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -93,6 +99,17 @@ async def api_temperature_review(req: ReviewRequest) -> dict:
     装载批次分别给出确定超界/可能超界区间,以及有首选区间批次的度时
     下界/上界与预算判定。输入变化后旧复核结果过期,需重新生成方案。"""
     return review(req.model_dump())
+
+
+@app.post("/api/transport-delay", tags=["delay"])
+async def api_transport_delay(req: DelayRequest) -> dict:
+    """运输延误推演:请求体携带生成方案时的输入快照(plan_input)、运输段序号
+    segment_no 与新增时长 extra_hours(小时,非负)。以快照重新规划得到的
+    已装箱明细为基准(箱号、批次与件数不变),按规划器选点与预算判定规则
+    重算延误后总时长、逐段设定点与各批累计度时,逐箱对比原值,列出超出
+    最长运输时长或度时预算的批次并标出度时首次超限段。输入变化后旧推演
+    结果过期,需重新生成方案。"""
+    return delay.simulate_delay(req.model_dump())
 
 
 # ---------------- 到货交接台账 ----------------

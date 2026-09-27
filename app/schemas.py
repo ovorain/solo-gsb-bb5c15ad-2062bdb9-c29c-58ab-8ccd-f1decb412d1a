@@ -96,6 +96,26 @@ class ReviewRequest(BaseModel):
     )
 
 
+class DelayRequest(BaseModel):
+    plan_input: PlanRequest = Field(
+        ...,
+        description="生成方案时的输入快照(请求体与 /api/plan 相同);"
+        "推演基于该快照重新规划,以已装箱明细(箱号/批次/件数)为基准,"
+        "输入变化后需重新生成方案再推演",
+    )
+    segment_no: int = Field(
+        ...,
+        gt=0,
+        description="要推演延误的运输段序号(对应方案 segments[].segment_no);"
+        "单一温区模式下全程视为第 1 段",
+    )
+    extra_hours: float = Field(
+        ...,
+        ge=0,
+        description="该运输段的新增时长(小时,非负);其余段时长、温区与锁温组不变",
+    )
+
+
 class HandoverOrderCreate(BaseModel):
     plan_input: PlanRequest = Field(
         ...,

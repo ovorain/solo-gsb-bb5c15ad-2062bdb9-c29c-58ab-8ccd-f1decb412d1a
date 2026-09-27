@@ -480,6 +480,11 @@ async function runPlan() {
       $("reviewMeta").innerHTML = "";
       $("reviewResult").innerHTML = "";
     }
+    if (delaySnapshot !== null && delaySnapshot !== newSnapshot) {
+      /* 方案已随输入变化,旧推演结果作废,需按新方案重新推演 */
+      delaySnapshot = null;
+      $("delayResult").innerHTML = "";
+    }
     planSnapshot = newSnapshot;
     planData = data;
     renderResult(data);
@@ -502,6 +507,7 @@ function renderResult(data) {
   data.boxes.forEach((b) => renderBox(b, data.volume_unit, data.summary.segment_mode));
   renderUnloaded(data.unloaded, data.volume_unit);
   setupReview(data);
+  setupDelay(data);
 }
 
 function showError(msg) {
@@ -986,10 +992,11 @@ function markAssessmentStale() {
   $("assessStale").hidden = cur === assessSnapshot;
 }
 
-/* 输入变化:旧评估/复核结果标记为已过期(快照比对,恢复原始输入会自动撤销标记) */
+/* 输入变化:旧评估/复核/推演结果标记为已过期(快照比对,恢复原始输入会自动撤销标记) */
 function markResultsStale() {
   markAssessmentStale();
   markReviewStale();
+  markDelayStale();
 }
 document.querySelector(".input-panel").addEventListener("input", markResultsStale);
 document.querySelector(".input-panel").addEventListener("click", (e) => {
@@ -1296,6 +1303,274 @@ $("handoverRecords").addEventListener("click", (e) => {
   const btn = e.target.closest(".btn-void");
   if (btn) voidRecord(Number(btn.dataset.id));
 });
+
+/* ---------------- 运输延误推演 ---------------- */
+/* 推演绑定生成方案时的输入快照;输入变化后旧推演过期,需重新生成方案 */
+let delaySnapshot = null; // 最近一次推演对应的方案快照
+
+function setupDelay(data) {
+  const view = $("delayView");
+  if (!data.boxes.length || !data.segments || !data.segments.length) {
+    view.hidden = true;
+    return;
+  }
+  view.hidden = false;
+  $("delaySegment").innerHTML = data.segments
+    .map((s) => {
+      const lock = s.lock_group ? ` · 🔒 ${s.lock_group}` : "";
+      return `<option value="${s.segment_no}">第 ${s.segment_no} 段 · ${escapeHtml(s.name)}` +
+        `（${fmt(s.hours)}h${lock}）</option>`;
+    })
+    .join("");
+}
+
+function showDelayError(msg) {
+  $("delayError").hidden = false;
+  $("delayError").textContent = "⚠ " + msg;
+}
+
+async function runDelay() {
+  $("delayError").hidden = true;
+  if (!planSnapshot) {
+    showDelayError("请先生成分箱方案");
+    return;
+  }
+  const segNo = Number($("delaySegment").value);
+  if (!segNo) {
+    showDelayError("请选择要推演延误的运输段");
+    return;
+  }
+  const raw = $("delayHours").value.trim();
+  if (raw === "") {
+    showDelayError("请填写新增时长(小时,非负;0 表示不延误)");
+    return;
+  }
+  const extra = Number(raw);
+  if (!(Number.isFinite(extra) && extra >= 0)) {
+    showDelayError("新增时长须为非负数值(小时)");
+    return;
+  }
+  const btn = $("btnDelay");
+  btn.disabled = true;
+  btn.textContent = "推演中…";
+  try {
+    const resp = await fetch("/api/transport-delay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        plan_input: JSON.parse(planSnapshot),
+        segment_no: segNo,
+        extra_hours: extra,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || `推演失败（HTTP ${resp.status}）`);
+    delaySnapshot = planSnapshot;
+    renderDelay(data);
+  } catch (e) {
+    showDelayError(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⏱ 开始推演";
+  }
+}
+
+function renderDelay(data) {
+  $("delayStale").hidden = true;
+  const sm = data.summary;
+  const d = data.delay;
+  const th = data.total_hours;
+
+  let chips = `
+    <span class="assess-chip">第 ${d.segment_no} 段「${escapeHtml(d.segment_name)}」新增 ${fmt(d.extra_hours)} h</span>
+    <span class="assess-chip">总时长 ${fmt(th.original)} → <strong>${fmt(th.delayed)}</strong> h（+${fmt(th.delta)}）</span>
+    <span class="assess-chip">推演箱数 ${sm.box_count}</span>
+    <span class="assess-chip muted">快照 ${data.input_fingerprint.slice(0, 8)}</span>`;
+  let headNote;
+  if (data.can_continue) {
+    headNote = `<div class="delay-verdict delay-ok">✓ ${escapeHtml(sm.verdict)}</div>`;
+  } else {
+    headNote = `<div class="delay-verdict delay-bad">⚠ ${escapeHtml(sm.verdict)}</div>` +
+      `<div class="assess-meta">
+        <span class="assess-chip chip-bad">超长运输 ${sm.max_transport_hours_violation_count} 项</span>
+        <span class="assess-chip ${sm.degree_hours_violation_count ? "chip-bad" : ""}">超度时预算 ${sm.degree_hours_violation_count} 项</span>
+        <span class="assess-chip">受影响 ${sm.affected_batch_count} 批 / ${fmt(sm.affected_units)} 件 / ${sm.affected_box_count} 箱</span>
+      </div>`;
+  }
+
+  const segRows = data.segments
+    .map(
+      (s) => `<tr class="${s.is_delayed ? "seg-warn" : ""}">
+        <td>第 ${s.segment_no} 段 · ${escapeHtml(s.name)}${
+          s.lock_group ? ` <span class="lock-badge">🔒 ${escapeHtml(s.lock_group)}</span>` : ""
+        }</td>
+        <td class="num">${fmt(s.hours_original)} h</td>
+        <td class="num"><strong>${fmt(s.hours_delayed)} h</strong>${
+          s.is_delayed ? ` <small class="muted">(+${fmt(s.hours_delayed - s.hours_original)})</small>` : ""
+        }</td>
+      </tr>`
+    )
+    .join("");
+  const segTable = `
+    <table class="seg-checks">
+      <thead><tr><th>运输段</th><th class="num">原时长</th><th class="num">延误后时长</th></tr></thead>
+      <tbody>${segRows}</tbody>
+    </table>`;
+
+  const affectedBlock = data.affected_batches.length
+    ? renderDelayAffected(data.affected_batches)
+    : "";
+  const boxBlocks = data.boxes.map(renderDelayBox).join("");
+
+  $("delayResult").innerHTML = `
+    <div class="assess-meta">${chips}</div>
+    ${headNote}
+    ${segTable}
+    ${affectedBlock}
+    <div class="detail-sub">逐箱对比:设定点与累计度时(原值 → 延误后)</div>
+    ${boxBlocks}`;
+}
+
+const DELAY_REASON_LABEL = {
+  max_transport_hours: "超最长运输时长",
+  degree_hours: "超度时预算",
+};
+
+function renderDelayAffected(list) {
+  const rows = list
+    .map((a) => {
+      const badges = a.reasons
+        .map((r) =>
+          r === "max_transport_hours"
+            ? `<span class="badge badge-bad">超最长运输时长</span>`
+            : `<span class="badge badge-bad">超度时预算` +
+              (a.first_exceeded_segment_no
+                ? ` · 首次超限第 ${a.first_exceeded_segment_no} 段「${escapeHtml(a.first_exceeded_segment_name || "")}」`
+                : "") +
+              `</span>`
+        )
+        .join(" ");
+      const hoursCell =
+        a.max_transport_hours !== null
+          ? `<td class="num">${fmt(a.total_hours_original)} → <strong class="heat-text-bad">${fmt(a.total_hours_delayed)}</strong> / ${fmt(a.max_transport_hours)} h</td>`
+          : `<td class="num muted">—</td>`;
+      const heatCell =
+        a.max_degree_hours !== null
+          ? `<td class="num">${fmt(a.exposure_original)} → <strong class="${
+              a.reasons.includes("degree_hours") ? "heat-text-bad" : ""
+            }">${fmt(a.exposure_delayed)}</strong> / ${fmt(a.max_degree_hours)} ℃·h</td>`
+          : `<td class="num muted">—</td>`;
+      return `<tr>
+        <td>第 ${a.box_no} 箱 · #${a.batch_no} ${escapeHtml(a.name)}</td>
+        <td class="num">${fmt(a.units)} 件</td>
+        ${hoursCell}
+        ${heatCell}
+        <td>${badges}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <div class="detail-sub delay-affected-title">受影响批次(超出最长运输时长或度时预算)</div>
+    <table class="seg-checks">
+      <thead><tr><th>箱号 · 批次</th><th class="num">件数</th>
+        <th class="num">总时长 / 最长运输时长</th>
+        <th class="num">累计度时 / 预算</th><th>超限情况</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDelayBox(box) {
+  const spRows = box.segment_setpoints
+    .map((s) => {
+      const spText = (v) => (v === null ? "—" : `${fmt(v)}℃`);
+      const changed = s.setpoint_changed
+        ? ' <span class="seg-badge">设定点变化</span>'
+        : "";
+      const lock = s.lock_group
+        ? ` <span class="lock-badge" title="相邻同组段共用设定点">🔒 ${escapeHtml(s.lock_group)}</span>`
+        : "";
+      return `<tr class="${s.is_delayed ? "seg-warn" : ""}">
+        <td>第 ${s.segment_no} 段 · ${escapeHtml(s.name)}${lock}</td>
+        <td class="num">${fmt(s.hours_original)} → ${fmt(s.hours_delayed)} h</td>
+        <td class="num">${spText(s.setpoint_original)} → <strong>${spText(s.setpoint_delayed)}</strong>${changed}</td>
+      </tr>`;
+    })
+    .join("");
+  const spTable = `
+    <table class="seg-checks">
+      <thead><tr><th>运输段</th><th class="num">时长 原 → 延误后</th>
+        <th class="num">设定点 原 → 延误后</th></tr></thead>
+      <tbody>${spRows}</tbody>
+    </table>`;
+
+  const heatEntries = box.heat_exposure || [];
+  let heatTable = "";
+  if (heatEntries.some((e) => e.max_degree_hours !== null || e.max_transport_hours !== null)) {
+    const rows = heatEntries
+      .map((e) => {
+        const show = (v) => (v === null || v === undefined ? "—" : fmt(v));
+        let status;
+        if (e.reasons.includes("max_transport_hours") && e.reasons.includes("degree_hours")) {
+          status = '<span class="heat-text-bad">⚠ 超最长运输时长 + 超度时预算</span>';
+        } else if (e.reasons.includes("max_transport_hours")) {
+          status = '<span class="heat-text-bad">⚠ 超最长运输时长</span>';
+        } else if (e.reasons.includes("degree_hours")) {
+          status = `<span class="heat-text-bad">⚠ 超度时预算(首次第 ${e.first_exceeded_segment_no} 段)</span>`;
+        } else {
+          status = '<span class="heat-text-ok">✓ 未超限</span>';
+        }
+        const cls = e.reasons.length ? "seg-bad" : "";
+        return `<tr class="${cls}">
+          <td>#${e.batch_no} ${escapeHtml(e.name)} <small class="muted">${fmt(e.units)} 件</small></td>
+          <td class="num">${show(e.exposure_original)} → <strong>${show(e.exposure_delayed)}</strong></td>
+          <td class="num">${show(e.max_degree_hours)}</td>
+          <td class="num">${show(e.remaining_original)} → ${show(e.remaining_delayed)}</td>
+          <td>${status}</td>
+        </tr>`;
+      })
+      .join("");
+    heatTable = `
+      <table class="seg-checks heat-table">
+        <thead><tr><th>批次</th><th class="num">累计度时 原 → 延误后 ℃·h</th>
+          <th class="num">预算 ℃·h</th><th class="num">剩余预算 原 → 延误后</th>
+          <th>状态</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  const affectedCls = box.affected_batch_count ? "delay-box-bad" : "delay-box-ok";
+  return `<div class="delay-box ${affectedCls}">
+    <div class="detail-head">
+      <strong>📦 第 ${box.box_no} 箱</strong>
+      ${
+        box.affected_batch_count
+          ? `<span class="badge badge-bad">${box.affected_batch_count} 批受影响</span>`
+          : '<span class="badge badge-ok">✓ 本箱无受影响批次</span>'
+      }
+    </div>
+    ${spTable}
+    ${heatTable}
+  </div>`;
+}
+
+$("btnDelay").addEventListener("click", runDelay);
+
+/* 输入变化:推演绑定生成方案时的快照,输入不一致则标记过期并禁用推演 */
+function markDelayStale() {
+  if ($("delayView").hidden || planSnapshot === null) return;
+  let cur = null;
+  try {
+    cur = JSON.stringify(collectInput());
+  } catch (e) {
+    cur = null;
+  }
+  const stale = cur !== planSnapshot;
+  $("delayStale").hidden = !stale;
+  $("delayStale").textContent = "⚠ 输入已变化,推演结果已过期,请重新生成方案";
+  $("btnDelay").disabled = stale;
+  $("delaySegment").disabled = stale;
+  $("delayHours").disabled = stale;
+}
 
 /* ---------------- 初始空行 ---------------- */
 addZoneRow({ name: "冷藏区", t_min: 0, t_max: 8 });

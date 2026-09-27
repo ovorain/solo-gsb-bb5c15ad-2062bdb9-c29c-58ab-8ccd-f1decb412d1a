@@ -130,6 +130,24 @@
           <div id="reviewResult"></div>
           <div id="reviewError" class="error-box" hidden></div>
         </div>
+
+        <!-- ============ 运输延误推演 ============ -->
+        <div id="delayView" hidden>
+          <h3>运输延误推演
+            <span id="delayStale" class="stale-badge" hidden>⚠ 输入已变化,推演结果已过期,请重新生成方案</span>
+          </h3>
+          <div class="delay-controls">
+            <label>延误运输段
+              <select id="delaySegment"></select>
+            </label>
+            <label>新增时长 (h,非负)
+              <input id="delayHours" type="number" min="0" step="any" value="0" placeholder="如 4" />
+            </label>
+            <button id="btnDelay" type="button" class="btn btn-small">⏱ 开始推演</button>
+          </div>
+          <div id="delayResult"></div>
+          <div id="delayError" class="error-box" hidden></div>
+        </div>
       </div>
 
       <!-- ============ 单温区故障容灾评估 ============ -->
