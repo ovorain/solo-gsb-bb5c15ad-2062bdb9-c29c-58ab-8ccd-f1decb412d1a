@@ -480,6 +480,15 @@ async function runPlan() {
       $("reviewMeta").innerHTML = "";
       $("reviewResult").innerHTML = "";
     }
+    if (delaySnapshot !== null && delaySnapshot !== newSnapshot) {
+      /* 方案已随输入变化,旧延误推演结果作废,需按新方案重新推演 */
+      delaySnapshot = null;
+      $("delayMeta").innerHTML = "";
+      $("delayVerdict").innerHTML = "";
+      $("delayAffected").innerHTML = "";
+      $("delayBoxes").innerHTML = "";
+      $("delayHours").value = "0";
+    }
     planSnapshot = newSnapshot;
     planData = data;
     renderResult(data);
@@ -502,6 +511,7 @@ function renderResult(data) {
   data.boxes.forEach((b) => renderBox(b, data.volume_unit, data.summary.segment_mode));
   renderUnloaded(data.unloaded, data.volume_unit);
   setupReview(data);
+  setupDelay(data);
 }
 
 function showError(msg) {
@@ -974,6 +984,256 @@ $("reviewErrorInput").addEventListener("input", () => {
   }
 });
 
+/* ---------------- 运输延误推演 ---------------- */
+/* 推演绑定生成方案时的输入快照;输入变化后旧推演过期,需重新生成方案 */
+let delaySnapshot = null; // 推演结果对应的方案快照(planSnapshot)
+
+function setupDelay(data) {
+  const view = $("delayView");
+  if (!data.boxes.length) {
+    view.hidden = true;
+    return;
+  }
+  view.hidden = false;
+  // 运输段下拉:分段模式取方案 segments,非分段模式只有唯一的「全程」段
+  const segs = data.segments && data.segments.length
+    ? data.segments
+    : [{ segment_no: 1, name: "全程", hours: data.summary.transport_hours }];
+  $("delaySegment").innerHTML = segs
+    .map(
+      (s) => `<option value="${s.segment_no}">第 ${s.segment_no} 段 · ${escapeHtml(s.name)}（${fmt(s.hours)}h${
+        s.lock_group ? ` · 🔒 ${escapeHtml(s.lock_group)}` : ""
+      }）</option>`
+    )
+    .join("");
+}
+
+function showDelayError(msg) {
+  $("delayError").hidden = false;
+  $("delayError").textContent = "⚠ " + msg;
+}
+
+async function runDelay() {
+  $("delayError").hidden = true;
+  if (!planSnapshot) {
+    showDelayError("请先生成分箱方案");
+    return;
+  }
+  const segmentNo = Number($("delaySegment").value);
+  if (!segmentNo) {
+    showDelayError("请选择发生延误的运输段");
+    return;
+  }
+  const raw = $("delayHours").value.trim();
+  if (raw === "") {
+    showDelayError("请填写新增时长(小时,非负;填 0 表示不延误)");
+    return;
+  }
+  const addedHours = Number(raw);
+  if (!(Number.isFinite(addedHours) && addedHours >= 0)) {
+    showDelayError("新增时长必须为非负数字(小时)");
+    return;
+  }
+  const btn = $("btnDelay");
+  btn.disabled = true;
+  btn.textContent = "推演中…";
+  try {
+    const resp = await fetch("/api/delay-simulation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        plan_input: JSON.parse(planSnapshot),
+        segment_no: segmentNo,
+        added_hours: addedHours,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || `推演失败（HTTP ${resp.status}）`);
+    delaySnapshot = planSnapshot;
+    renderDelay(data);
+  } catch (e) {
+    showDelayError(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⏱ 开始推演";
+  }
+}
+
+function renderDelay(data) {
+  $("delayStale").hidden = true;
+  const d = data.delay;
+  const sm = data.summary;
+  $("delayMeta").innerHTML = `
+    <span class="assess-chip">延误段:第 ${d.segment_no} 段 · ${escapeHtml(d.segment_name)}</span>
+    <span class="assess-chip">该段时长 ${fmt(d.hours_original)} → <strong>${fmt(d.hours_delayed)}</strong> h（+${fmt(d.added_hours)}）</span>
+    <span class="assess-chip">总时长 ${fmt(data.transport_hours_original)} → <strong>${fmt(data.transport_hours_delayed)}</strong> h</span>
+    <span class="assess-chip ${sm.setpoint_changed_count ? "chip-warn" : ""}">设定点变化 ${sm.setpoint_changed_count} 段·箱</span>
+    <span class="assess-chip muted">快照 ${data.input_fingerprint.slice(0, 8)}</span>`;
+
+  // 总判定
+  if (sm.can_continue) {
+    $("delayVerdict").innerHTML = `
+      <div class="delay-verdict delay-ok">
+        ✓ <strong>可继续运输</strong>:延误 ${fmt(d.added_hours)} h 后,
+        全部 ${sm.box_count} 箱的已装载批次均未超出最长运输时长或度时预算
+        （无受影响批次）${sm.setpoint_changed_count ? "·部分运输段设定点已自动重新优选" : ""}
+      </div>`;
+    $("delayAffected").innerHTML = "";
+  } else {
+    $("delayVerdict").innerHTML = `
+      <div class="delay-verdict delay-bad">
+        ⚠ <strong>不可继续运输</strong>:延误后有 <strong>${sm.affected_batch_count}</strong>
+        个批次（涉及 ${sm.affected_box_count} 箱）超出最长运输时长或度时预算
+      </div>`;
+    $("delayAffected").innerHTML = renderDelayAffected(data.affected_batches);
+  }
+
+  $("delayBoxes").innerHTML = data.boxes
+    .map((b) => renderDelayBox(b))
+    .join("");
+}
+
+function renderDelayAffected(list) {
+  const rows = list
+    .map((a) => {
+      const tags = [];
+      if (a.transport_exceeded)
+        tags.push(
+          `<span class="seg-badge">超时:总时长 ${fmt(a.transport_hours_delayed)}h &gt; 最长 ${fmt(a.max_transport_hours)}h</span>`
+        );
+      if (a.first_exceeded_segment_no !== null)
+        tags.push(
+          `<span class="seg-badge">度时首次超限:第 ${a.first_exceeded_segment_no} 段 · ${escapeHtml(a.first_exceeded_segment_name)}</span>`
+        );
+      else if (a.max_degree_hours !== null && a.max_cumulative_exposure_delayed !== null &&
+               a.max_cumulative_exposure_delayed > a.max_degree_hours)
+        tags.push('<span class="seg-badge">度时超预算</span>');
+      const dh =
+        a.max_degree_hours !== null
+          ? `预算 ${fmt(a.max_degree_hours)} · 延误后最大累计 <strong>${fmt(a.max_cumulative_exposure_delayed)}</strong> ℃·h`
+          : "未设度时预算";
+      return `<tr class="seg-bad">
+        <td>#${a.batch_no} ${escapeHtml(a.name)}</td>
+        <td class="num">${fmt(a.loaded_units)} 件 · 第 ${a.box_nos.join("、")} 箱</td>
+        <td class="num">${a.max_transport_hours !== null ? `最长 ${fmt(a.max_transport_hours)}h` : "—"}</td>
+        <td class="num">${dh}</td>
+        <td>${tags.join(" ")}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <div class="detail-sub">受影响批次（跨箱汇总）</div>
+    <table class="seg-checks delay-affected-table">
+      <thead><tr><th>批次</th><th class="num">已装 / 所在箱</th><th class="num">最长运输时长</th>
+        <th class="num">度时预算 / 延误后累计</th><th>超限标记</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDelaySegTable(box) {
+  const rows = box.segment_checks
+    .map((c) => {
+      const lock = c.lock_group
+        ? `<span class="lock-badge" title="相邻同组段共用设定点">🔒 ${escapeHtml(c.lock_group)}（第 ${c.lock_group_segments.join("、")} 段共用）</span>`
+        : "";
+      const hoursText =
+        c.hours_added > 0
+          ? `<strong>${fmt(c.hours_original)} → ${fmt(c.hours_delayed)}</strong> h（+${fmt(c.hours_added)}）`
+          : `${fmt(c.hours_original)} h`;
+      const spOrig = c.setpoint_original === null ? "—" : `${fmt(c.setpoint_original)}℃`;
+      const spNew = c.setpoint_delayed === null ? "—" : `${fmt(c.setpoint_delayed)}℃`;
+      const spText = c.setpoint_changed
+        ? `<span class="heat-text-warn">${spOrig} → <strong>${spNew}</strong> 🔄</span>`
+        : `${spOrig}${spOrig !== spNew ? ` → ${spNew}` : ""}`;
+      return `<tr class="${c.hours_added > 0 ? "seg-warn" : ""}">
+        <td>第 ${c.segment_no} 段 · ${escapeHtml(c.name)}${lock}</td>
+        <td class="num">${hoursText}</td>
+        <td>${fmtSegs(c.temperature_segments)}</td>
+        <td class="num">${spText}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <table class="seg-checks">
+      <thead><tr><th>运输段</th><th class="num">时长(原 → 延误后)</th>
+        <th>可设定温度 / 匹配温区(不变)</th><th class="num">设定点(原 → 延误后)</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDelayHeatTable(box) {
+  const anyBudget = box.heat_exposure.some((h) => h.max_degree_hours !== null);
+  if (!anyBudget) return "";
+  const rows = box.heat_exposure
+    .map((h) => {
+      if (h.max_degree_hours === null) {
+        return `<tr><td>#${h.batch_no} ${escapeHtml(h.name)}</td>
+          <td colspan="5" class="muted">未设度时预算,不参与度时判定</td></tr>`;
+      }
+      const inc = h.exposure_increase === null ? "—" : `+${fmt(h.exposure_increase)}`;
+      let status;
+      if (h.budget_exceeded_delayed) {
+        status = `<span class="heat-text-bad">⚠ 超预算${
+          h.first_exceeded_segment_no !== null
+            ? `(首次超限:第 ${h.first_exceeded_segment_no} 段「${escapeHtml(h.first_exceeded_segment_name)}」)`
+            : ""
+        }</span>`;
+      } else if (h.transport_exceeded) {
+        status = '<span class="heat-text-warn">度时预算内 · 但运输超时</span>';
+      } else {
+        status = '<span class="heat-text-ok">✓ 预算内</span>';
+      }
+      return `<tr class="${h.affected ? "seg-bad" : ""}">
+        <td>#${h.batch_no} ${escapeHtml(h.name)}（${fmt(h.units)} 件）</td>
+        <td class="num">${fmt(h.max_degree_hours)}</td>
+        <td class="num">${h.cumulative_exposure_original === null ? "—" : fmt(h.cumulative_exposure_original)}</td>
+        <td class="num"><strong>${h.cumulative_exposure_delayed === null ? "—" : fmt(h.cumulative_exposure_delayed)}</strong>（${inc}）</td>
+        <td class="num">${fmt(h.max_degree_hours - h.cumulative_exposure_delayed)}</td>
+        <td>${status}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <table class="seg-checks heat-table">
+      <thead><tr><th>热暴露核算(批次)</th><th class="num">预算 ℃·h</th>
+        <th class="num">原累计 ℃·h</th><th class="num">延误后累计 ℃·h(增量)</th>
+        <th class="num">剩余预算 ℃·h</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDelayBox(box) {
+  const badge = box.affected
+    ? '<span class="badge badge-bad">⚠ 存在超限批次</span>'
+    : '<span class="badge badge-ok">✓ 无受影响批次</span>';
+  return `<div class="box-card delay-box ${box.affected ? "delay-box-bad" : ""}">
+    <div class="box-head">
+      <span class="box-title">📦 第 ${box.box_no} 箱 ${badge}</span>
+      <span class="temp-segments">可设定温度(不变): ${fmtSegs(box.temperature_segments)}</span>
+    </div>
+    ${renderDelaySegTable(box)}
+    ${renderDelayHeatTable(box)}
+  </div>`;
+}
+
+$("btnDelay").addEventListener("click", runDelay);
+
+/* 输入变化:推演绑定生成方案时的快照,输入不一致则禁用推演并提示重新生成方案 */
+function markDelayStale() {
+  if ($("delayView").hidden || planSnapshot === null) return;
+  let cur = null;
+  try {
+    cur = JSON.stringify(collectInput());
+  } catch (e) {
+    cur = null; // 输入暂时不完整,也视为已变化
+  }
+  const stale = cur !== planSnapshot;
+  $("delayStale").hidden = !stale;
+  $("btnDelay").disabled = stale;
+  $("delaySegment").disabled = stale;
+  $("delayHours").disabled = stale;
+}
+
 /* 输入变化:旧评估结果标记为已过期(快照比对,恢复原始输入会自动撤销标记) */
 function markAssessmentStale() {
   if ($("assessView").hidden || assessSnapshot === null) return;
@@ -986,10 +1246,11 @@ function markAssessmentStale() {
   $("assessStale").hidden = cur === assessSnapshot;
 }
 
-/* 输入变化:旧评估/复核结果标记为已过期(快照比对,恢复原始输入会自动撤销标记) */
+/* 输入变化:旧评估/复核/推演结果标记为已过期(快照比对,恢复原始输入会自动撤销标记) */
 function markResultsStale() {
   markAssessmentStale();
   markReviewStale();
+  markDelayStale();
 }
 document.querySelector(".input-panel").addEventListener("input", markResultsStale);
 document.querySelector(".input-panel").addEventListener("click", (e) => {

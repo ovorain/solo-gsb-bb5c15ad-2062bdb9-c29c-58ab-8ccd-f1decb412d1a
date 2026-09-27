@@ -8,10 +8,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db, handover
+from .delay import simulate_delay
 from .planner import plan
 from .resilience import assess_zone_failures
 from .review import review
 from .schemas import (
+    DelaySimulationRequest,
     HandoverOrderCreate,
     HandoverRecordsSubmit,
     PlanRequest,
@@ -38,8 +40,12 @@ app = FastAPI(
     "以及到货交接台账:从当前方案创建交接单冻结各箱各批次应交件数,"
     "多行签收/退回整笔入账(净签收量不得小于 0 或超过应交量),"
     "支持撤销记录(重放校验,越界则拒绝并指出冲突记录),"
-    "交接单与记录存入 SQLite,重启后可继续办理",
-    version="1.7.0",
+    "交接单与记录存入 SQLite,重启后可继续办理;"
+    "以及运输延误推演:选择运输段与新增时长(非负小时),以输入快照与已装箱"
+    "明细为基准(箱号、批次及件数不变)重新计算总时长、逐段设定点与各批"
+    "累计度时,相邻同锁温组仍共用设定点,逐箱对比并标出超限批次与度时首次"
+    "超限段,无受影响批次时给出可继续运输",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -95,8 +101,21 @@ async def api_temperature_review(req: ReviewRequest) -> dict:
     return review(req.model_dump())
 
 
-# ---------------- 到货交接台账 ----------------
+@app.post("/api/delay-simulation", tags=["delay"])
+async def api_delay_simulation(req: DelaySimulationRequest) -> dict:
+    """运输延误推演:请求体携带生成方案时的输入快照(plan_input)、延误运输段
+    序号 segment_no 与新增时长 added_hours(小时,非负)。以快照重新规划的
+    已装箱明细为基准,保持箱号、批次及件数不变,仅延长指定段时长,按规划器
+    规则重新计算总时长、逐段设定点(相邻同锁温组仍共用设定点)与各批累计
+    度时;逐箱对比原值与延误后值,列出超出最长运输时长或度时预算的批次并
+    标出度时首次超限段,无受影响批次时明确给出可继续运输。输入变化后旧
+    推演结果过期(响应含快照指纹),需重新生成方案后再推演。"""
+    return simulate_delay(
+        req.plan_input.model_dump(), req.segment_no, req.added_hours
+    )
 
+
+# ---------------- 到货交接台账 ----------------
 
 @app.post("/api/handover-orders", tags=["handover"], status_code=201)
 async def api_handover_create(req: HandoverOrderCreate) -> dict:

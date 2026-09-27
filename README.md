@@ -36,10 +36,18 @@ Docker 命名卷上）。支持 **一次提交多行签收/退回记录**（每�
 记录——撤销前按原顺序 **跳过该记录重放** 其余有效记录，若任何后续记录导致数量
 越界则 **拒绝撤销并指出冲突记录**，原台账保持不变。页面实时展示记录列表与各箱
 各批次的 **净签收 / 待交件数**。
+支持 **运输延误推演**：在分箱结果页选择一个运输段并填写新增时长（小时，
+非负），系统以生成方案时的 **输入快照** 与 **已装箱明细** 为基准——
+**箱号、批次及件数保持不变**，仅延长所选段时长，按规划器原有规则重新计算
+**延误后的总时长、逐段设定点与各批累计度时**（相邻同锁温组仍共用设定点，
+选点与预算判定沿用规划器规则）；逐箱对比原值与延误后值，列出 **超出最长
+运输时长或度时预算的批次**，并标出度时 **首次超限段**；没有受影响批次时
+明确显示 **可继续运输**。推演绑定生成方案时的输入快照，输入变化后旧推演
+自动标记为 **已过期**。
 支持在页面上随时修改输入并重新规划。
 
-- 后端：FastAPI（规划算法见 `app/planner.py`；交接台账见 `app/handover.py`，
-  使用 SQLite 持久化，见 `app/db.py`）
+- 后端：FastAPI（规划算法见 `app/planner.py`；运输延误推演见 `app/delay.py`；
+  交接台账见 `app/handover.py`，使用 SQLite 持久化，见 `app/db.py`）
 - 前端：原生 HTML / CSS / JavaScript（无 CDN 依赖，离线可用）
 - 部署：Docker Compose（数据库初始化与持久化卷已纳入启动）
 
@@ -80,6 +88,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 规划接口 | `POST http://localhost:8000/api/plan` |
 | 容灾评估接口 | `POST http://localhost:8000/api/zone-failure-assessment` |
 | 实测温度复核接口 | `POST http://localhost:8000/api/temperature-review` |
+| 运输延误推演接口 | `POST http://localhost:8000/api/delay-simulation` |
 | 创建交接单 | `POST http://localhost:8000/api/handover-orders` |
 | 交接单列表 / 详情 | `GET http://localhost:8000/api/handover-orders` · `GET /api/handover-orders/{id}` |
 | 提交签收/退回记录 | `POST http://localhost:8000/api/handover-orders/{id}/records` |
@@ -155,7 +164,25 @@ APP_PORT=9000 docker compose up -d --build
    - 复核绑定 **生成方案时的输入快照**；此后修改任意输入，复核区出现
      **「已过期」** 标记并禁用复核按钮，重新生成方案后即可再次复核；
    - 点击 **「下载 CSV 模板」** 可按当前方案全程秒数生成空白模板。
-8. 结果页底部的 **到货交接台账** 区管理交接单（无需重新生成方案即可查看，
+8. 生成方案后，在结果页 **运输延误推演** 区：
+   - 在 **延误运输段** 下拉中选择发生延误的运输段（分段模式列出各段并标注
+     锁温组；非分段模式只有唯一的「全程」段），在 **新增时长 (h,非负)**
+     中填写该段延长的小时数（填 0 表示不延误），点击 **「⏱ 开始推演」**；
+   - 顶部统计条展示延误段时长（原 → 延误后）、总时长（原 → 延误后）、
+     设定点发生变化的段·箱数与输入快照指纹；
+   - 无任何批次超出最长运输时长或度时预算时，显示绿色
+     **「✓ 可继续运输」**；否则显示红色 **「不可继续运输」**，并在
+     **受影响批次** 表中列出批次、已装件数/所在箱、最长运输时长、
+     度时预算与延误后最大累计度时，以及 **超时** 与
+     **度时首次超限段**（第几段 · 段名）徽章；
+   - 下方 **逐箱卡片** 对比：每段时长（原 → 延误后，延误段高亮）、
+     可设定温度（不变）与 **逐段设定点**（原值 → 延误后值，发生变化时
+     以 🔄 标出；锁温组段仍展示 🔒 共享设定点），以及各批
+     **累计度时**（原值、延误后值与增量、剩余预算、状态，超限行标红并
+     注明首次超限段）；
+   - 推演绑定 **生成方案时的输入快照**；此后修改任意输入，推演区出现
+     **「已过期」** 标记并禁用推演按钮，重新生成方案后即可再次推演。
+9. 结果页底部的 **到货交接台账** 区管理交接单（无需重新生成方案即可查看，
    页面打开时自动加载已有交接单，重启后可继续办理）：
    - 生成方案后点击 **「🧾 从当前方案创建交接单」**，系统按当前方案冻结
      各箱各批次的应交件数生成新交接单；此后修改规划输入不影响该单；
@@ -260,6 +287,96 @@ APP_PORT=9000 docker compose up -d --build
   度时下界=上界=实测度时、`within`/`certain_exceeded` 判定与原复核一致；
 - 响应携带输入快照的 SHA-256 指纹（`input_fingerprint`），输入变化后前端
   将旧复核结果标记为已过期，需重新生成方案后再复核。
+
+## 七之二、运输延误推演规则
+
+- 推演请求携带 **生成方案时的输入快照**（`plan_input`，与 `/api/plan`
+  请求体相同）、延误运输段序号 `segment_no`（分段模式对应 `segments`
+  序号；非分段模式只有唯一「全程」段，填 `1`）与 **新增时长**
+  `added_hours`（小时，非负，负数返回 422）；
+- 服务端按快照 **重新规划** 得到基准方案，推演时严格保持
+  **箱号、批次及每批件数不变**（不重新装箱），只把指定段时长增加
+  `added_hours`（其余段时长不变）；基准方案没有任何已装箱货物时拒绝
+  推演（400），`segment_no` 超出段数返回 400；
+- 延误后 **总时长 = 原总时长 + 新增时长**；各箱 **逐段设定点** 与
+  **各批累计度时** 完全按规划器规则重新计算：相邻同锁温组的段仍
+  **共用一个设定点**，候选点仍取单元可行温度段端点与首选区间端点，
+  选取使单元结束时箱内最大累计预算使用率最低的点（平局取较低温度），
+  累计暴露 **严格大于** 预算即超限并记录 **度时首次超限段**；延误可能
+  使后续运输段/锁温组的最优设定点发生变化（响应逐段标出
+  `setpoint_changed`）；可设定温度段与匹配温区不随时长变化；
+- **逐箱对比原值与延误后值**：每段时长、设定点（含锁温组共享设定点），
+  以及各批累计度时、增量与剩余预算；
+- **受影响批次**：延误后 **总时长超出该批「最长运输时长」**，或任一所在箱
+  **累计度时超出预算**（跨箱去重，度时取各箱延误后累计的最大值，首次
+  超限段取各箱中最早的段），并汇总该批已装件数与所在箱号；
+- 没有受影响批次时 `summary.can_continue = true`，页面明确显示
+  **「✓ 可继续运输」**；
+- 响应携带输入快照的 SHA-256 指纹（`input_fingerprint`），输入变化后
+  前端将旧推演标记为已过期，需重新生成方案后再推演。
+
+### 运输延误推演接口示例
+
+```bash
+curl -X POST http://localhost:8000/api/delay-simulation \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_input": {
+      "box_capacity": 12,
+      "segments": [
+        {"name": "干线冷链", "hours": 14,
+         "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+        {"name": "末端配送", "hours": 4,
+         "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]}
+      ],
+      "cargoes": [
+        {"name": "鲜奶", "units": 10, "unit_volume": 0.4, "t_min": 2, "t_max": 6,
+         "preferred_t_min": 3, "preferred_t_max": 5, "max_degree_hours": 20,
+         "max_transport_hours": 20}
+      ]
+    },
+    "segment_no": 1,
+    "added_hours": 3
+  }'
+```
+
+原总时长 18h，第 1 段延长 3h 后总时长 21h，超过鲜奶「最长运输时长」
+20h（该批设定点在首选区间内，度时仍为 0、不超预算）。响应（节选）：
+
+```json
+{
+  "input_fingerprint": "…",
+  "delay": {"segment_no": 1, "segment_name": "干线冷链",
+            "hours_original": 14.0, "added_hours": 3.0, "hours_delayed": 17.0},
+  "segment_mode": true,
+  "transport_hours_original": 18.0,
+  "transport_hours_delayed": 21.0,
+  "transport_hours_increase": 3.0,
+  "affected_batches": [
+    {"batch_no": 1, "name": "鲜奶", "loaded_units": 10, "box_nos": [1],
+     "max_transport_hours": 20.0, "transport_hours_delayed": 21.0,
+     "transport_exceeded": true, "max_degree_hours": 20.0,
+     "max_cumulative_exposure_delayed": 0.0,
+     "first_exceeded_segment_no": null, "first_exceeded_segment_name": null}
+  ],
+  "summary": {"box_count": 1, "affected_box_count": 1,
+              "affected_batch_count": 1, "setpoint_changed_count": 0,
+              "can_continue": false}
+}
+```
+
+### 运输延误推演响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `input_fingerprint` | 输入快照的 SHA-256 指纹；输入变化后前端据此将旧推演标记为已过期 |
+| `delay` | 延误段：`segment_no` / `segment_name`、原时长 `hours_original`、新增时长 `added_hours`、延误后时长 `hours_delayed` |
+| `transport_hours_original` / `transport_hours_delayed` / `transport_hours_increase` | 原总时长、延误后总时长与增量（h） |
+| `boxes[].segment_checks[]` | 逐段对比：原/延误后时长（`hours_original` / `hours_delayed` / `hours_added`）、可设定温度段与匹配温区（不变）、原/延误后设定点（`setpoint_original` / `setpoint_delayed` / `setpoint_changed`）；锁温组段附 `lock_group`、`lock_group_segments` 与原/延误后共享设定点 |
+| `boxes[].heat_exposure[]` | 各批对比：预算、原/延误后累计度时（`cumulative_exposure_original` / `cumulative_exposure_delayed` / `exposure_increase`）、原/延误后预算超限标志、**首次超限段** `first_exceeded_segment_no` / `first_exceeded_segment_name`、最长运输时长与 `transport_exceeded`、`affected` 与 `reasons` |
+| `boxes[].affected` | 该箱是否存在受影响批次 |
+| `affected_batches[]` | 跨箱去重的受影响批次：批号/名称、已装件数 `loaded_units`、所在箱 `box_nos`、最长运输时长与 `transport_exceeded`、预算与延误后最大累计度时、度时首次超限段 |
+| `summary` | 箱数、受影响箱数/批次数、设定点变化的段·箱数 `setpoint_changed_count`、`can_continue`（无受影响批次时为 `true`） |
 
 ## 八、到货交接台账规则
 
@@ -740,6 +857,7 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── main.py        # FastAPI 入口、异常映射与静态资源挂载
 │   ├── planner.py     # 温区兼容 + 容量约束 + 热暴露预算 + 锁温区段分箱算法
 │   ├── resilience.py  # 单温区故障容灾评估(逐温区模拟失效并重规划)
+│   ├── delay.py       # 运输延误推演(固定箱号/批次/件数,重算设定点与累计度时)
 │   ├── review.py      # 实测温度复核(CSV 校验、仪器误差带、确定/可能超界切段、度时上下界积分)
 │   ├── handover.py    # 到货交接台账(交接单冻结、多行签收/退回整笔入账、撤销重放校验)
 │   ├── db.py          # SQLite 连接与建表(WAL、外键、显式事务)
@@ -749,7 +867,8 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── styles.css
 │   └── app.js
 ├── tests/
-│   └── test_handover.py  # 台账 API 测试(python tests/test_handover.py)
+│   ├── test_handover.py  # 台账 API 测试(python tests/test_handover.py)
+│   └── test_delay.py     # 运输延误推演测试(python tests/test_delay.py)
 ├── Dockerfile
 ├── docker-compose.yml # 含 SQLite 初始化与 handover-data 持久化卷
 ├── .env.example

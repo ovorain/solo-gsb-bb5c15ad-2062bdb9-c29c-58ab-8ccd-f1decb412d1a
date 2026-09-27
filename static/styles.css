@@ -525,6 +525,30 @@ select:focus, input[type="file"]:focus {
 .review-none { padding: 6px 0 2px; }
 table.review-exc { width: 100%; margin: 8px 0 0; }
 
+/* ---------- 运输延误推演 ---------- */
+#delayView { margin-top: 26px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.delay-hint { font-size: 12.5px; margin: 2px 0 8px; line-height: 1.7; }
+.delay-verdict {
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin: 8px 0 12px;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+.delay-verdict.delay-ok {
+  border: 1px solid #bfe3cd;
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.delay-verdict.delay-bad {
+  border: 1px solid #f0cdc9;
+  background: var(--err-bg);
+  color: var(--err);
+}
+table.delay-affected-table { width: 100%; margin: 4px 0 12px; }
+.delay-box { margin-bottom: 12px; }
+.delay-box-bad { border-color: #e9b3ad; }
+
 /* ---------- 到货交接台账 ---------- */
 #handoverView { margin-top: 26px; border-top: 1px dashed var(--line); padding-top: 6px; }
 #handoverView h3 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

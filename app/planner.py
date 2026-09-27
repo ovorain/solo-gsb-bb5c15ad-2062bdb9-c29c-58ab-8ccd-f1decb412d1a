@@ -356,17 +356,14 @@ def _parse_zones(raw_zones: list[dict[str, Any]], ctx: str) -> list[_Zone]:
     return zones
 
 
-def plan(payload: dict[str, Any]) -> dict[str, Any]:
-    """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
-    box_capacity = float(payload.get("box_capacity", 0))
-    max_boxes = int(payload.get("max_boxes", 100))
-    volume_unit = str(payload.get("volume_unit") or "体积单位").strip() or "体积单位"
+def parse_segments(
+    payload: dict[str, Any]
+) -> tuple[list["_Segment"], float, bool]:
+    """解析运输段与总运输时长,返回 (运输段列表, 总时长h, 是否分段模式)。
 
-    if box_capacity <= 0:
-        raise ValueError("箱体容量必须大于 0")
-    if max_boxes <= 0:
-        raise ValueError("最大箱数必须大于 0")
-
+    分段模式下总时长为各段时长之和,显式给的 transport_hours 必须一致;
+    非分段模式把全程单一温区视为唯一运输段。输入不合法时抛 ValueError。
+    """
     th_raw = payload.get("transport_hours")
     raw_segments = payload.get("segments") or []
     segment_mode = bool(raw_segments)
@@ -405,19 +402,23 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                     f"运输时长 {_r(th)}h 与各运输段时长之和 {_r(total_hours)}h "
                     f"不一致,请修正,或留空自动按段时长求和"
                 )
-        transport_hours = total_hours
-    else:
-        # 兼容模式:全程单一温区,视为唯一运输段
-        transport_hours = 0.0 if th_raw in (None, "") else float(th_raw)
-        if transport_hours < 0:
-            raise ValueError("运输时长不能为负数")
-        zones = _parse_zones(payload.get("zones") or [], "")
-        if not zones:
-            raise ValueError("至少需要定义一个允许温区")
-        segments.append(
-            _Segment(no=1, name="全程", hours=transport_hours, zones=zones)
-        )
+        return segments, total_hours, True
 
+    # 兼容模式:全程单一温区,视为唯一运输段
+    transport_hours = 0.0 if th_raw in (None, "") else float(th_raw)
+    if transport_hours < 0:
+        raise ValueError("运输时长不能为负数")
+    zones = _parse_zones(payload.get("zones") or [], "")
+    if not zones:
+        raise ValueError("至少需要定义一个允许温区")
+    segments.append(
+        _Segment(no=1, name="全程", hours=transport_hours, zones=zones)
+    )
+    return segments, transport_hours, False
+
+
+def parse_batches(payload: dict[str, Any]) -> list["_Batch"]:
+    """解析货物批次(含首选区间/度时预算/最长运输时长);输入不合法抛 ValueError。"""
     batches: list[_Batch] = []
     for i, c in enumerate(payload.get("cargoes") or []):
         name = str(c.get("name") or f"批次 {i + 1}")
@@ -469,6 +470,22 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         )
     if not batches:
         raise ValueError("至少需要录入一批货物")
+    return batches
+
+
+def plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
+    box_capacity = float(payload.get("box_capacity", 0))
+    max_boxes = int(payload.get("max_boxes", 100))
+    volume_unit = str(payload.get("volume_unit") or "体积单位").strip() or "体积单位"
+
+    if box_capacity <= 0:
+        raise ValueError("箱体容量必须大于 0")
+    if max_boxes <= 0:
+        raise ValueError("最大箱数必须大于 0")
+
+    segments, transport_hours, segment_mode = parse_segments(payload)
+    batches = parse_batches(payload)
 
     boxes: list[_Box] = []
     unloaded: list[dict[str, Any]] = []
